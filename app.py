@@ -4,6 +4,7 @@ import time
 import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -60,17 +61,28 @@ TIMEOUT = env_int(
     min_value=1
 )
 
-# 每个频道最多保留多少个不同直播源
 MAX_SOURCES_PER_CHANNEL = env_int(
     "MAX_SOURCES_PER_CHANNEL",
     5,
     min_value=1
 )
 
-# 手动刷新鉴权 token（可选）
+# 并发抓取节点的线程数
+NODE_FETCH_WORKERS = env_int(
+    "NODE_FETCH_WORKERS",
+    32,
+    min_value=1
+)
+
+# 最多处理多少个节点
+MAX_NODES = env_int(
+    "MAX_NODES",
+    300,
+    min_value=1
+)
+
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
-# 是否启用后台自动刷新循环（多 worker 部署时建议关闭，改用外部定时调用 /refresh）
 ENABLE_REFRESH_LOOP = os.getenv(
     "ENABLE_REFRESH_LOOP",
     "true"
@@ -81,10 +93,24 @@ ENABLE_REFRESH_LOOP = os.getenv(
 # HTTP Session
 # ============================================================
 
-session = requests.Session()
+_thread_local = threading.local()
 
-session.headers.update({
-    "User-Agent": "IPTV-Aggregator-Raymond/1.2"
+
+def get_session():
+    """每个线程独立 Session，避免 requests.Session 的线程安全问题。"""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "IPTV-Aggregator-Raymond/1.3"
+        })
+        _thread_local.session = s
+    return _thread_local.session
+
+
+# 用于获取节点列表的主 Session（仅主线程使用）
+main_session = requests.Session()
+main_session.headers.update({
+    "User-Agent": "IPTV-Aggregator-Raymond/1.3"
 })
 
 
@@ -102,8 +128,11 @@ last_success_nodes = 0
 last_failed_nodes = 0
 last_channels = 0
 
+# 刷新进度（运行中可见）
+refresh_in_progress = False
+refresh_progress_done = 0
+refresh_progress_total = 0
 
-# 防止多个 refresh 同时执行
 refresh_lock = threading.Lock()
 
 
@@ -114,11 +143,9 @@ refresh_lock = threading.Lock()
 def get_nodes():
     url = f"{SPIDER_URL}/api/hotel/ips"
 
-    response = session.get(
+    response = main_session.get(
         url,
-        params={
-            "limit": 1000
-        },
+        params={"limit": 1000},
         timeout=TIMEOUT
     )
 
@@ -127,9 +154,7 @@ def get_nodes():
     data = response.json()
 
     if not isinstance(data, list):
-        raise RuntimeError(
-            "Node API returned invalid data"
-        )
+        raise RuntimeError("Node API returned invalid data")
 
     return data
 
@@ -141,11 +166,7 @@ def get_nodes():
 def node_score(node):
     text = " ".join(
         str(node.get(field) or "")
-        for field in [
-            "region",
-            "city",
-            "isp"
-        ]
+        for field in ["region", "city", "isp"]
     )
 
     score = 0
@@ -164,35 +185,25 @@ def node_score(node):
 def get_node_m3u(node_id):
     url = f"{SPIDER_URL}/api/hotel/ips/{node_id}/m3u"
 
-    response = session.get(
-        url,
-        timeout=TIMEOUT
-    )
+    session = get_session()
+
+    response = session.get(url, timeout=TIMEOUT)
 
     if response.status_code != 200:
-        print(
-            f"[WARNING] Node {node_id} "
-            f"HTTP {response.status_code}"
-        )
-        return ""
+        return "", f"HTTP {response.status_code}"
 
-    # 使用 utf-8-sig 自动去除 BOM
     text = response.content.decode(
         "utf-8-sig",
         errors="ignore"
     ).strip()
 
     if not text:
-        return ""
+        return "", "empty body"
 
     if "#EXTM3U" not in text:
-        print(
-            f"[WARNING] Node {node_id} "
-            f"returned non-M3U data"
-        )
-        return ""
+        return "", "non-M3U data"
 
-    return text
+    return text, None
 
 
 # ============================================================
@@ -221,7 +232,6 @@ def parse_m3u(m3u_text):
 
             url = line
 
-            # 必须存在 EXTINF
             if not any(
                 item.startswith("#EXTINF:")
                 for item in current_block
@@ -229,13 +239,7 @@ def parse_m3u(m3u_text):
                 current_block = []
                 continue
 
-            blocks.append(
-                (
-                    current_block,
-                    url
-                )
-            )
-
+            blocks.append((current_block, url))
             current_block = []
 
         else:
@@ -249,15 +253,6 @@ def parse_m3u(m3u_text):
 # ============================================================
 
 def get_channel_info(block):
-    """
-    从 #EXTINF 中提取频道显示名和唯一键。
-
-    返回 (display_name, key)
-
-    display_name 优先使用 tvg-name，其次逗号后的名称。
-    key 优先使用 tvg-id，其次 display_name。
-    """
-
     display_name = ""
     key = ""
 
@@ -266,19 +261,16 @@ def get_channel_info(block):
         if not line.startswith("#EXTINF:"):
             continue
 
-        # 提取 tvg-id
         m = re.search(r'tvg-id="([^"]*)"', line)
         if m and m.group(1).strip():
             key = m.group(1).strip()
 
-        # 提取 tvg-name
         m = re.search(r'tvg-name="([^"]*)"', line)
         if m and m.group(1).strip():
             display_name = m.group(1).strip()
             if not key:
                 key = display_name
 
-        # 如果还没有 display_name，尝试逗号后的文本
         if not display_name and "," in line:
             name = line.split(",", 1)[1].strip()
             if name:
@@ -299,6 +291,19 @@ def get_channel_info(block):
 
 
 # ============================================================
+# Fetch one node (runs in thread pool)
+# ============================================================
+
+def fetch_one_node(index, node):
+    node_id = node.get("id")
+    try:
+        m3u, err = get_node_m3u(node_id)
+        return index, m3u, err
+    except Exception as e:
+        return index, "", str(e)
+
+
+# ============================================================
 # Build M3U
 # ============================================================
 
@@ -307,49 +312,62 @@ def build_m3u():
     global last_nodes
     global last_success_nodes
     global last_failed_nodes
+    global refresh_progress_done
+    global refresh_progress_total
 
     nodes = get_nodes()
 
     last_nodes = len(nodes)
 
-    # --------------------------------------------------------
-    # Priority sorting
-    # --------------------------------------------------------
+    # 只取打分最高的前 MAX_NODES 个节点
+    nodes.sort(key=node_score, reverse=True)
+    nodes = nodes[:MAX_NODES]
 
-    nodes.sort(
-        key=node_score,
-        reverse=True
-    )
+    refresh_progress_total = len(nodes)
+    refresh_progress_done = 0
 
-    print(
-        f"[INFO] Nodes: {len(nodes)}"
-    )
-
-    print(
-        f"[INFO] Priority keywords: "
-        f"{PRIORITY_KEYWORDS}"
-    )
-
-    print(
-        f"[INFO] Max sources per channel: "
-        f"{MAX_SOURCES_PER_CHANNEL}"
-    )
+    print(f"[INFO] Nodes fetched: {last_nodes}")
+    print(f"[INFO] Nodes selected: {len(nodes)} (MAX_NODES={MAX_NODES})")
+    print(f"[INFO] Priority keywords: {PRIORITY_KEYWORDS}")
+    print(f"[INFO] Max sources per channel: {MAX_SOURCES_PER_CHANNEL}")
+    print(f"[INFO] Concurrent workers: {NODE_FETCH_WORKERS}")
 
     # --------------------------------------------------------
-    # Output
+    # 并发抓取所有节点（顺序保持）
+    # --------------------------------------------------------
+
+    fetch_results = [None] * len(nodes)
+
+    with ThreadPoolExecutor(
+        max_workers=NODE_FETCH_WORKERS,
+        thread_name_prefix="node-fetch"
+    ) as executor:
+
+        future_to_index = {
+            executor.submit(fetch_one_node, i, node): i
+            for i, node in enumerate(nodes)
+        }
+
+        for future in as_completed(future_to_index):
+            idx, m3u, err = future.result()
+            fetch_results[idx] = (m3u, err)
+
+            refresh_progress_done += 1
+
+            if refresh_progress_done % 20 == 0 or \
+               refresh_progress_done == len(nodes):
+                print(
+                    f"[INFO] Progress: "
+                    f"{refresh_progress_done}/{len(nodes)}"
+                )
+
+    # --------------------------------------------------------
+    # 合并结果（按优先级顺序处理）
     # --------------------------------------------------------
 
     all_blocks = []
-
-    # 全局 URL 去重
     seen_urls = set()
-
-    # 每个频道已经保存多少个源（按 channel_key 计数）
     channel_source_count = {}
-
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
 
     success_nodes = 0
     failed_nodes = 0
@@ -358,199 +376,85 @@ def build_m3u():
     total_duplicate_urls = 0
     total_limit_skipped = 0
 
-    # --------------------------------------------------------
-    # Process nodes
-    # --------------------------------------------------------
-
-    for index, node in enumerate(
-        nodes,
-        start=1
-    ):
+    for index, node in enumerate(nodes):
 
         node_id = node.get("id")
-
         region = node.get("region") or ""
         city = node.get("city") or ""
         isp = node.get("isp") or ""
-
         score = node_score(node)
 
-        print(
-            f"[INFO] [{index}/{len(nodes)}] "
-            f"Node {node_id} "
-            f"{region} "
-            f"{city} "
-            f"{isp} "
-            f"Score={score}"
-        )
+        m3u, err = fetch_results[index] if fetch_results[index] else ("", "not fetched")
 
-        try:
-
-            # ------------------------------------------------
-            # Get M3U
-            # ------------------------------------------------
-
-            m3u = get_node_m3u(node_id)
-
-            if not m3u:
-
-                print(
-                    f"[WARNING] Node {node_id} "
-                    f"returned 0 channels."
-                )
-
-                failed_nodes += 1
-                continue
-
-            # ------------------------------------------------
-            # Parse M3U
-            # ------------------------------------------------
-
-            blocks = parse_m3u(m3u)
-
-            if not blocks:
-
-                print(
-                    f"[WARNING] Node {node_id} "
-                    f"parsed 0 channels."
-                )
-
-                failed_nodes += 1
-                continue
-
-            # 节点成功获取并解析出频道
-            success_nodes += 1
-
-            node_new_channels = 0
-            node_duplicate_urls = 0
-            node_limit_skipped = 0
-
-            # ------------------------------------------------
-            # Process channels
-            # ------------------------------------------------
-
-            for block, url in blocks:
-
-                url = url.strip()
-
-                if not url:
-                    continue
-
-                # --------------------------------------------
-                # Global URL duplicate
-                # --------------------------------------------
-
-                if url in seen_urls:
-
-                    node_duplicate_urls += 1
-                    total_duplicate_urls += 1
-
-                    continue
-
-                # --------------------------------------------
-                # Channel info
-                # --------------------------------------------
-
-                display_name, channel_key = get_channel_info(block)
-
-                if not channel_key:
-                    # 没有频道标识时，用 URL 作为唯一标识
-                    channel_key = url
-
-                # --------------------------------------------
-                # Channel source limit
-                # --------------------------------------------
-
-                current_count = (
-                    channel_source_count.get(
-                        channel_key,
-                        0
-                    )
-                )
-
-                if (
-                    current_count
-                    >= MAX_SOURCES_PER_CHANNEL
-                ):
-
-                    node_limit_skipped += 1
-                    total_limit_skipped += 1
-
-                    continue
-
-                # --------------------------------------------
-                # Accept source
-                # --------------------------------------------
-
-                seen_urls.add(url)
-
-                all_blocks.extend(block)
-                all_blocks.append(url)
-
-                channel_source_count[
-                    channel_key
-                ] = current_count + 1
-
-                node_new_channels += 1
-                total_new_channels += 1
-
-            # ------------------------------------------------
-            # Node statistics
-            # ------------------------------------------------
-
-            if node_new_channels > 0:
-
-                print(
-                    f"[INFO] Node {node_id}: "
-                    f"{node_new_channels} new sources"
-                )
-
-            elif node_duplicate_urls > 0:
-
-                print(
-                    f"[INFO] Node {node_id}: "
-                    f"all usable URLs duplicated"
-                )
-
-            else:
-
-                print(
-                    f"[INFO] Node {node_id}: "
-                    f"no new sources"
-                )
-
-        except Exception as e:
-
+        if not m3u:
             failed_nodes += 1
-
             print(
                 f"[WARNING] Node {node_id} "
-                f"failed: {e}"
+                f"({region} {city} {isp}) "
+                f"failed: {err}"
             )
-
             continue
 
-    # --------------------------------------------------------
-    # Save statistics
-    # --------------------------------------------------------
+        blocks = parse_m3u(m3u)
+
+        if not blocks:
+            failed_nodes += 1
+            print(
+                f"[WARNING] Node {node_id} parsed 0 channels"
+            )
+            continue
+
+        success_nodes += 1
+
+        node_new = 0
+        node_dup = 0
+        node_limit = 0
+
+        for block, url in blocks:
+
+            url = url.strip()
+            if not url:
+                continue
+
+            if url in seen_urls:
+                node_dup += 1
+                total_duplicate_urls += 1
+                continue
+
+            display_name, channel_key = get_channel_info(block)
+            if not channel_key:
+                channel_key = url
+
+            current_count = channel_source_count.get(channel_key, 0)
+
+            if current_count >= MAX_SOURCES_PER_CHANNEL:
+                node_limit += 1
+                total_limit_skipped += 1
+                continue
+
+            seen_urls.add(url)
+            all_blocks.extend(block)
+            all_blocks.append(url)
+
+            channel_source_count[channel_key] = current_count + 1
+
+            node_new += 1
+            total_new_channels += 1
+
+        print(
+            f"[INFO] Node {node_id} "
+            f"{region} {city} {isp} "
+            f"Score={score} "
+            f"new={node_new} dup={node_dup} limit={node_limit}"
+        )
 
     last_success_nodes = success_nodes
     last_failed_nodes = failed_nodes
 
-    # --------------------------------------------------------
-    # Validate result
-    # --------------------------------------------------------
-
     if not all_blocks:
-
         raise RuntimeError(
-            "No channels collected "
-            "from selected nodes"
+            "No channels collected from selected nodes"
         )
-
-    # --------------------------------------------------------
-    # Build final M3U
-    # --------------------------------------------------------
 
     result = (
         "#EXTM3U\n"
@@ -558,51 +462,18 @@ def build_m3u():
         + "\n"
     )
 
-    channel_count = result.count(
-        "#EXTINF:"
-    )
+    channel_count = result.count("#EXTINF:")
 
     print("=" * 60)
-
-    print(
-        f"[INFO] Build completed"
-    )
-
-    print(
-        f"[INFO] Nodes: "
-        f"{len(nodes)}"
-    )
-
-    print(
-        f"[INFO] Successful nodes: "
-        f"{success_nodes}"
-    )
-
-    print(
-        f"[INFO] Failed nodes: "
-        f"{failed_nodes}"
-    )
-
-    print(
-        f"[INFO] Unique channels/sources: "
-        f"{channel_count}"
-    )
-
-    print(
-        f"[INFO] Unique URLs: "
-        f"{len(seen_urls)}"
-    )
-
-    print(
-        f"[INFO] Duplicate URLs skipped: "
-        f"{total_duplicate_urls}"
-    )
-
-    print(
-        f"[INFO] Source-limit skipped: "
-        f"{total_limit_skipped}"
-    )
-
+    print("[INFO] Build completed")
+    print(f"[INFO] Nodes total: {last_nodes}")
+    print(f"[INFO] Nodes selected: {len(nodes)}")
+    print(f"[INFO] Successful nodes: {success_nodes}")
+    print(f"[INFO] Failed nodes: {failed_nodes}")
+    print(f"[INFO] Unique channels/sources: {channel_count}")
+    print(f"[INFO] Unique URLs: {len(seen_urls)}")
+    print(f"[INFO] Duplicate URLs skipped: {total_duplicate_urls}")
+    print(f"[INFO] Source-limit skipped: {total_limit_skipped}")
     print("=" * 60)
 
     return result
@@ -618,90 +489,43 @@ def refresh():
     global last_update
     global last_error
     global last_channels
+    global refresh_in_progress
 
-    # --------------------------------------------------------
-    # Prevent concurrent refresh
-    # --------------------------------------------------------
-
-    if not refresh_lock.acquire(
-        blocking=False
-    ):
-
-        print(
-            "[WARNING] Refresh already running."
-        )
-
+    if not refresh_lock.acquire(blocking=False):
+        print("[WARNING] Refresh already running.")
         return
+
+    refresh_in_progress = True
 
     try:
 
         print("=" * 60)
-
-        print(
-            "[INFO] Starting refresh..."
-        )
-
-        # ----------------------------------------------------
-        # Build
-        # ----------------------------------------------------
+        print("[INFO] Starting refresh...")
 
         m3u = build_m3u()
 
-        # ----------------------------------------------------
-        # Count channels
-        # ----------------------------------------------------
-
-        channel_count = m3u.count(
-            "#EXTINF:"
-        )
+        channel_count = m3u.count("#EXTINF:")
 
         if channel_count <= 0:
-
-            raise RuntimeError(
-                "No channels collected"
-            )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Only replace cache after successful build
-        # ----------------------------------------------------
+            raise RuntimeError("No channels collected")
 
         cached_m3u = m3u
-
         last_channels = channel_count
-
-        last_update = (
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
+        last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         last_error = None
 
-        print(
-            f"[INFO] Refresh completed: "
-            f"{channel_count} channels"
-        )
-
+        print(f"[INFO] Refresh completed: {channel_count} channels")
         print("=" * 60)
 
     except Exception as e:
 
         last_error = str(e)
-
-        print(
-            f"[ERROR] Refresh failed: {e}"
-        )
-
-        print(
-            "[INFO] Existing cached M3U "
-            "will be kept."
-        )
-
+        print(f"[ERROR] Refresh failed: {e}")
+        print("[INFO] Existing cached M3U will be kept.")
         print("=" * 60)
 
     finally:
-
+        refresh_in_progress = False
         refresh_lock.release()
 
 
@@ -710,24 +534,16 @@ def refresh():
 # ============================================================
 
 def refresh_loop():
-
     while True:
-
         refresh()
 
-        sleep_seconds = (
-            REFRESH_INTERVAL_HOURS
-            * 3600
-        )
+        sleep_seconds = REFRESH_INTERVAL_HOURS * 3600
 
         print(
             f"[INFO] Next refresh in "
             f"{REFRESH_INTERVAL_HOURS} hours."
         )
-
-        time.sleep(
-            sleep_seconds
-        )
+        time.sleep(sleep_seconds)
 
 
 # ============================================================
@@ -737,54 +553,32 @@ def refresh_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    print(
-        "[INFO] IPTV Aggregator starting..."
-    )
-
-    print(
-        f"[INFO] Spider URL: {SPIDER_URL}"
-    )
-
-    print(
-        f"[INFO] Refresh interval: "
-        f"{REFRESH_INTERVAL_HOURS} hours"
-    )
-
-    print(
-        f"[INFO] Max sources/channel: "
-        f"{MAX_SOURCES_PER_CHANNEL}"
-    )
-
-    print(
-        f"[INFO] Refresh loop enabled: "
-        f"{ENABLE_REFRESH_LOOP}"
-    )
-
-    # --------------------------------------------------------
-    # Start background refresh
-    # --------------------------------------------------------
+    print("[INFO] IPTV Aggregator starting...")
+    print(f"[INFO] Spider URL: {SPIDER_URL}")
+    print(f"[INFO] Refresh interval: {REFRESH_INTERVAL_HOURS} hours")
+    print(f"[INFO] Max sources/channel: {MAX_SOURCES_PER_CHANNEL}")
+    print(f"[INFO] Node fetch workers: {NODE_FETCH_WORKERS}")
+    print(f"[INFO] Max nodes: {MAX_NODES}")
+    print(f"[INFO] Refresh loop enabled: {ENABLE_REFRESH_LOOP}")
 
     if ENABLE_REFRESH_LOOP:
-        thread = threading.Thread(
+        t = threading.Thread(
             target=refresh_loop,
             daemon=True,
             name="iptv-refresh"
         )
-        thread.start()
     else:
-        # 如果不启用循环，至少启动时刷新一次
-        thread = threading.Thread(
+        t = threading.Thread(
             target=refresh,
             daemon=True,
             name="iptv-initial-refresh"
         )
-        thread.start()
+
+    t.start()
 
     yield
 
-    print(
-        "[INFO] IPTV Aggregator shutting down..."
-    )
+    print("[INFO] IPTV Aggregator shutting down...")
 
 
 # ============================================================
@@ -793,7 +587,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPTV Aggregator Raymond",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan
 )
 
@@ -804,27 +598,22 @@ app = FastAPI(
 
 @app.get("/")
 def root():
-
     return {
         "service": "IPTV Aggregator Raymond",
         "status": "OK",
         "spider_url": SPIDER_URL,
         "priority_keywords": PRIORITY_KEYWORDS,
-        "refresh_interval_hours":
-            REFRESH_INTERVAL_HOURS,
-        "max_sources_per_channel":
-            MAX_SOURCES_PER_CHANNEL,
-        "refresh_loop_enabled":
-            ENABLE_REFRESH_LOOP,
-        "admin_token_required":
-            bool(ADMIN_TOKEN),
+        "refresh_interval_hours": REFRESH_INTERVAL_HOURS,
+        "max_sources_per_channel": MAX_SOURCES_PER_CHANNEL,
+        "node_fetch_workers": NODE_FETCH_WORKERS,
+        "max_nodes": MAX_NODES,
+        "refresh_loop_enabled": ENABLE_REFRESH_LOOP,
+        "admin_token_required": bool(ADMIN_TOKEN),
         "last_update": last_update,
         "channels": last_channels,
         "nodes": last_nodes,
-        "success_nodes":
-            last_success_nodes,
-        "failed_nodes":
-            last_failed_nodes,
+        "success_nodes": last_success_nodes,
+        "failed_nodes": last_failed_nodes,
         "error": last_error,
         "iptv_url": "/iptv"
     }
@@ -836,17 +625,16 @@ def root():
 
 @app.get("/health")
 def health():
-
     return {
         "status": "OK",
         "last_update": last_update,
         "channels": last_channels,
         "nodes": last_nodes,
-        "success_nodes":
-            last_success_nodes,
-        "failed_nodes":
-            last_failed_nodes,
-        "error": last_error
+        "success_nodes": last_success_nodes,
+        "failed_nodes": last_failed_nodes,
+        "error": last_error,
+        "refresh_in_progress": refresh_in_progress,
+        "refresh_progress": f"{refresh_progress_done}/{refresh_progress_total}"
     }
 
 
@@ -854,12 +642,8 @@ def health():
 # M3U output
 # ============================================================
 
-@app.get(
-    "/iptv",
-    response_class=PlainTextResponse
-)
+@app.get("/iptv", response_class=PlainTextResponse)
 def iptv():
-
     return cached_m3u
 
 
@@ -872,27 +656,19 @@ def manual_refresh(
     authorization: str = Header(None),
     token: str = Query(None)
 ):
-
-    # 如果设置了 ADMIN_TOKEN，则必须通过鉴权
     if ADMIN_TOKEN:
         expected = f"Bearer {ADMIN_TOKEN}"
         if authorization != expected and token != ADMIN_TOKEN:
-            raise HTTPException(
-                status_code=403,
-                detail="Forbidden"
-            )
+            raise HTTPException(status_code=403, detail="Forbidden")
 
-    thread = threading.Thread(
+    t = threading.Thread(
         target=refresh,
         daemon=True,
         name="manual-refresh"
     )
+    t.start()
 
-    thread.start()
-
-    return {
-        "status": "refresh_started"
-    }
+    return {"status": "refresh_started"}
 
 
 # ============================================================
@@ -903,17 +679,9 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8080"
-        )
-    )
+    port = int(os.getenv("PORT", "8080"))
 
-    print(
-        f"[INFO] Starting Uvicorn "
-        f"on 0.0.0.0:{port}"
-    )
+    print(f"[INFO] Starting Uvicorn on 0.0.0.0:{port}")
 
     uvicorn.run(
         app,
