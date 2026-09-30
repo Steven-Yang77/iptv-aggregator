@@ -1,23 +1,30 @@
+```python
 import os
-import re
 import time
 import threading
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 import requests
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="IPTV Aggregator Raymond")
+
+# ============================================================
+# 配置
+# ============================================================
 
 SPIDER_URL = os.getenv(
     "SPIDER_URL",
     "https://iptvs.910501.xyz"
-)
+).rstrip("/")
 
 PRIORITY_KEYWORDS = [
     x.strip()
-    for x in os.getenv("PRIORITY_KEYWORDS", "北京,联通").split(",")
+    for x in os.getenv(
+        "PRIORITY_KEYWORDS",
+        "北京,联通"
+    ).split(",")
     if x.strip()
 ]
 
@@ -25,32 +32,78 @@ REFRESH_INTERVAL_HOURS = float(
     os.getenv("REFRESH_INTERVAL_HOURS", "12")
 )
 
-TIMEOUT = int(os.getenv("TIMEOUT", "15"))
+TIMEOUT = int(
+    os.getenv("TIMEOUT", "15")
+)
+
+
+# ============================================================
+# HTTP Session
+# ============================================================
 
 session = requests.Session()
 
+session.headers.update({
+    "User-Agent": "IPTV-Aggregator-Raymond/1.0"
+})
+
+
+# ============================================================
+# 全局缓存
+# ============================================================
+
 cached_m3u = "#EXTM3U\n"
+
 last_update = None
 last_error = None
 
+last_nodes = 0
+last_success_nodes = 0
+last_failed_nodes = 0
+last_channels = 0
+
+
+# ============================================================
+# 获取节点列表
+# ============================================================
 
 def get_nodes():
     url = f"{SPIDER_URL}/api/hotel/ips"
 
-    r = session.get(
+    response = session.get(
         url,
-        params={"limit": 1000},
-        timeout=TIMEOUT,
+        params={
+            "limit": 1000
+        },
+        timeout=TIMEOUT
     )
-    r.raise_for_status()
 
-    return r.json()
+    response.raise_for_status()
 
+    data = response.json()
+
+    if not isinstance(data, list):
+        raise RuntimeError("Node API returned invalid data")
+
+    return data
+
+
+# ============================================================
+# 节点优先级
+#
+# 注意：
+# PRIORITY_KEYWORDS 只用于排序。
+# 不会因为节点不匹配关键词而被排除。
+# ============================================================
 
 def node_score(node):
     text = " ".join(
-        str(node.get(x) or "")
-        for x in ["region", "city", "isp"]
+        str(node.get(field) or "")
+        for field in [
+            "region",
+            "city",
+            "isp"
+        ]
     )
 
     score = 0
@@ -62,151 +115,288 @@ def node_score(node):
     return score
 
 
+# ============================================================
+# 获取单个节点 M3U
+# ============================================================
+
 def get_node_m3u(node_id):
     url = f"{SPIDER_URL}/api/hotel/ips/{node_id}/m3u"
 
-    r = session.get(
+    response = session.get(
         url,
-        timeout=TIMEOUT,
+        timeout=TIMEOUT
     )
 
-    if r.status_code != 200:
+    if response.status_code != 200:
+        print(
+            f"[WARNING] Node {node_id} HTTP {response.status_code}"
+        )
         return ""
 
-    text = r.text.strip()
+    text = response.text.strip()
 
-    if not text or "#EXTM3U" not in text:
+    if not text:
+        return ""
+
+    if "#EXTM3U" not in text:
+        print(
+            f"[WARNING] Node {node_id} returned non-M3U data"
+        )
         return ""
 
     return text
 
 
-def normalize_m3u(text):
-    if not text:
-        return []
+# ============================================================
+# 解析 M3U
+#
+# 一个节目通常是：
+#
+# #EXTINF:-1,...
+# http://xxxx
+#
+# 保留完整节目块。
+# ============================================================
 
-    lines = text.splitlines()
+def parse_m3u(m3u_text):
+    lines = [
+        line.strip()
+        for line in m3u_text.splitlines()
+        if line.strip()
+    ]
 
-    result = []
+    blocks = []
+
+    current_block = []
 
     for line in lines:
-        line = line.strip()
 
-        if not line:
+        if line == "#EXTM3U":
             continue
 
-        if line.startswith("#EXTM3U"):
-            continue
+        # URL 行
+        if not line.startswith("#"):
 
-        result.append(line)
+            if not current_block:
+                continue
 
-    return result
+            url = line
 
+            # 当前节目必须有 EXTINF
+            if not any(
+                x.startswith("#EXTINF:")
+                for x in current_block
+            ):
+                current_block = []
+                continue
+
+            blocks.append(
+                (
+                    current_block,
+                    url
+                )
+            )
+
+            current_block = []
+
+        else:
+            current_block.append(line)
+
+    return blocks
+
+
+# ============================================================
+# 构建最终 M3U
+# ============================================================
 
 def build_m3u():
+
+    global last_nodes
+    global last_success_nodes
+    global last_failed_nodes
+
     nodes = get_nodes()
 
+    last_nodes = len(nodes)
+
+    # 按优先级排序
     nodes.sort(
         key=node_score,
         reverse=True
     )
 
     print(
-        f"[INFO] Nodes: {len(nodes)}, "
-        f"keywords: {PRIORITY_KEYWORDS}"
+        f"[INFO] Nodes: {len(nodes)}"
+    )
+
+    print(
+        f"[INFO] Priority keywords: "
+        f"{PRIORITY_KEYWORDS}"
     )
 
     all_blocks = []
+
     seen_urls = set()
 
-    for node in nodes:
+    success_nodes = 0
+    failed_nodes = 0
 
-        score = node_score(node)
+    # ========================================================
+    # 逐个尝试节点
+    # ========================================================
+
+    for index, node in enumerate(nodes, start=1):
 
         node_id = node.get("id")
 
+        region = node.get("region") or ""
+        city = node.get("city") or ""
+        isp = node.get("isp") or ""
+
+        score = node_score(node)
+
         print(
-            f"[INFO] Node {node_id} "
-            f"{node.get('region')} "
-            f"{node.get('isp')} "
+            f"[INFO] "
+            f"[{index}/{len(nodes)}] "
+            f"Node {node_id} "
+            f"{region} "
+            f"{isp} "
             f"Score={score}"
         )
 
         try:
+
             m3u = get_node_m3u(node_id)
 
             if not m3u:
+
                 print(
-                    f"[WARNING] Node {node_id} "
-                    f"returned 0 channels."
+                    f"[WARNING] "
+                    f"Node {node_id} returned 0 channels."
                 )
+
+                failed_nodes += 1
                 continue
 
-            lines = m3u.splitlines()
+            blocks = parse_m3u(m3u)
 
-            current_block = []
+            if not blocks:
 
-            for line in lines:
+                print(
+                    f"[WARNING] "
+                    f"Node {node_id} parsed 0 channels."
+                )
 
-                line = line.strip()
+                failed_nodes += 1
+                continue
 
-                if not line or line == "#EXTM3U":
+            new_channels = 0
+
+            for block, url in blocks:
+
+                # URL 去重
+                if url in seen_urls:
                     continue
 
-                current_block.append(line)
+                seen_urls.add(url)
 
-                if not line.startswith("#"):
-                    url = line
+                all_blocks.extend(block)
+                all_blocks.append(url)
 
-                    if url in seen_urls:
-                        current_block = []
-                        continue
+                new_channels += 1
 
-                    seen_urls.add(url)
+            if new_channels > 0:
 
-                    all_blocks.extend(current_block)
+                success_nodes += 1
 
-                    current_block = []
+                print(
+                    f"[INFO] "
+                    f"Node {node_id}: "
+                    f"{new_channels} new channels"
+                )
 
-            print(
-                f"[INFO] Node {node_id} "
-                f"channels collected."
-            )
+            else:
+
+                print(
+                    f"[WARNING] "
+                    f"Node {node_id}: "
+                    f"all channels duplicated"
+                )
 
         except Exception as e:
 
+            failed_nodes += 1
+
             print(
-                f"[WARNING] Node {node_id} "
-                f"failed: {e}"
+                f"[WARNING] "
+                f"Node {node_id} failed: {e}"
             )
 
             continue
 
-    result = "#EXTM3U\n"
+    last_success_nodes = success_nodes
+    last_failed_nodes = failed_nodes
 
-    result += "\n".join(all_blocks)
+    # ========================================================
+    # 最终 M3U
+    # ========================================================
+
+    if not all_blocks:
+
+        raise RuntimeError(
+            "No channels collected from selected nodes"
+        )
+
+    result = (
+        "#EXTM3U\n"
+        + "\n".join(all_blocks)
+        + "\n"
+    )
 
     return result
 
+
+# ============================================================
+# 刷新
+# ============================================================
 
 def refresh():
 
     global cached_m3u
     global last_update
     global last_error
+    global last_channels
 
     try:
 
-        print("[INFO] Starting refresh...")
+        print("=" * 60)
+
+        print(
+            "[INFO] Starting refresh..."
+        )
 
         m3u = build_m3u()
 
-        if m3u.count("#EXTINF") == 0:
+        channel_count = m3u.count(
+            "#EXTINF:"
+        )
+
+        if channel_count <= 0:
+
             raise RuntimeError(
                 "No channels collected"
             )
 
+        # ====================================================
+        # 只有新数据正常时才替换缓存
+        #
+        # 如果这次刷新失败：
+        # Cinetry 继续使用旧数据。
+        # ====================================================
+
         cached_m3u = m3u
+
+        last_channels = channel_count
 
         last_update = datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -216,8 +406,10 @@ def refresh():
 
         print(
             f"[INFO] Refresh completed: "
-            f"{m3u.count('#EXTINF')} channels"
+            f"{channel_count} channels"
         )
+
+        print("=" * 60)
 
     except Exception as e:
 
@@ -227,6 +419,16 @@ def refresh():
             f"[ERROR] Refresh failed: {e}"
         )
 
+        print(
+            "[INFO] Existing cached M3U will be kept."
+        )
+
+        print("=" * 60)
+
+
+# ============================================================
+# 自动刷新线程
+# ============================================================
 
 def refresh_loop():
 
@@ -234,10 +436,64 @@ def refresh_loop():
 
         refresh()
 
-        time.sleep(
-            REFRESH_INTERVAL_HOURS * 3600
+        sleep_seconds = (
+            REFRESH_INTERVAL_HOURS
+            * 3600
         )
 
+        print(
+            f"[INFO] Next refresh in "
+            f"{REFRESH_INTERVAL_HOURS} hours."
+        )
+
+        time.sleep(
+            sleep_seconds
+        )
+
+
+# ============================================================
+# FastAPI Lifespan
+#
+# 替代已经 deprecated 的:
+#
+# @app.on_event("startup")
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    print(
+        "[INFO] IPTV Aggregator starting..."
+    )
+
+    thread = threading.Thread(
+        target=refresh_loop,
+        daemon=True
+    )
+
+    thread.start()
+
+    yield
+
+    print(
+        "[INFO] IPTV Aggregator shutting down..."
+    )
+
+
+# ============================================================
+# FastAPI App
+# ============================================================
+
+app = FastAPI(
+    title="IPTV Aggregator Raymond",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+
+# ============================================================
+# 首页
+# ============================================================
 
 @app.get("/")
 def root():
@@ -245,22 +501,70 @@ def root():
     return {
         "service": "IPTV Aggregator Raymond",
         "status": "OK",
-        "last_update": last_update,
-        "keywords": PRIORITY_KEYWORDS,
-        "channels": cached_m3u.count("#EXTINF"),
-        "error": last_error,
+
+        "spider_url": SPIDER_URL,
+
+        "priority_keywords": PRIORITY_KEYWORDS,
+
+        "refresh_interval_hours":
+            REFRESH_INTERVAL_HOURS,
+
+        "last_update":
+            last_update,
+
+        "channels":
+            last_channels,
+
+        "nodes":
+            last_nodes,
+
+        "success_nodes":
+            last_success_nodes,
+
+        "failed_nodes":
+            last_failed_nodes,
+
+        "error":
+            last_error,
+
+        "iptv_url":
+            "/iptv"
     }
 
+
+# ============================================================
+# Health
+# ============================================================
 
 @app.get("/health")
 def health():
 
     return {
         "status": "OK",
-        "last_update": last_update,
-        "channels": cached_m3u.count("#EXTINF"),
+
+        "last_update":
+            last_update,
+
+        "channels":
+            last_channels,
+
+        "nodes":
+            last_nodes,
+
+        "success_nodes":
+            last_success_nodes,
+
+        "failed_nodes":
+            last_failed_nodes,
+
+        "error":
+            last_error
     }
 
+
+# ============================================================
+# IPTV M3U
+# ============================================================
 
 @app.get(
     "/iptv",
@@ -271,12 +575,94 @@ def iptv():
     return cached_m3u
 
 
-@app.on_event("startup")
-def startup():
+# ============================================================
+# 手动刷新
+# ============================================================
+
+@app.get("/refresh")
+def manual_refresh():
 
     thread = threading.Thread(
-        target=refresh_loop,
+        target=refresh,
         daemon=True
     )
 
     thread.start()
+
+    return {
+        "status": "refresh_started"
+    }
+
+
+# ============================================================
+# 启动
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "8080"
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
+```
+
+### `requirements.txt`
+
+同时确认 GitHub 里的 `requirements.txt` 是：
+
+```text id="91720f"
+fastapi==0.117.1
+uvicorn==0.36.0
+requests==2.32.5
+```
+
+### 然后这样操作
+
+**GitHub：**
+
+1. 替换 `app.py`
+2. 确认 `requirements.txt`
+3. `Commit changes`
+
+**Blitz：**
+
+1. 等 GitHub 新 commit 出现
+2. `Build again`
+3. 等启动
+
+这次正常的话，日志应该首先出现：
+
+```text
+[INFO] IPTV Aggregator starting...
+[INFO] Starting refresh...
+[INFO] Nodes: ...
+[INFO] Priority keywords: ['北京', '联通']
+```
+
+然后逐个测试节点。
+
+最重要的是：**即使北京联通节点返回 0 个频道，也会继续往后跑，不会像原来的程序一样直接结束。**
+
+启动成功后，我们再访问：
+
+```text
+/health
+```
+
+和：
+
+```text
+/iptv
+```
+
+确认最终 Cinetry 使用的 M3U。
