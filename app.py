@@ -1,18 +1,38 @@
-
 import os
+import re
 import time
 import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 
 # ============================================================
 # Configuration
 # ============================================================
+
+def env_float(name, default, min_value=None):
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None and value < min_value:
+        value = min_value
+    return value
+
+
+def env_int(name, default, min_value=None):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None and value < min_value:
+        value = min_value
+    return value
+
 
 SPIDER_URL = os.getenv(
     "SPIDER_URL",
@@ -28,27 +48,33 @@ PRIORITY_KEYWORDS = [
     if x.strip()
 ]
 
-REFRESH_INTERVAL_HOURS = float(
-    os.getenv(
-        "REFRESH_INTERVAL_HOURS",
-        "12"
-    )
+REFRESH_INTERVAL_HOURS = env_float(
+    "REFRESH_INTERVAL_HOURS",
+    12.0,
+    min_value=0.1
 )
 
-TIMEOUT = int(
-    os.getenv(
-        "TIMEOUT",
-        "15"
-    )
+TIMEOUT = env_int(
+    "TIMEOUT",
+    15,
+    min_value=1
 )
 
 # 每个频道最多保留多少个不同直播源
-MAX_SOURCES_PER_CHANNEL = int(
-    os.getenv(
-        "MAX_SOURCES_PER_CHANNEL",
-        "5"
-    )
+MAX_SOURCES_PER_CHANNEL = env_int(
+    "MAX_SOURCES_PER_CHANNEL",
+    5,
+    min_value=1
 )
+
+# 手动刷新鉴权 token（可选）
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+# 是否启用后台自动刷新循环（多 worker 部署时建议关闭，改用外部定时调用 /refresh）
+ENABLE_REFRESH_LOOP = os.getenv(
+    "ENABLE_REFRESH_LOOP",
+    "true"
+).lower() in ("1", "true", "yes")
 
 
 # ============================================================
@@ -58,7 +84,7 @@ MAX_SOURCES_PER_CHANNEL = int(
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "IPTV-Aggregator-Raymond/1.0"
+    "User-Agent": "IPTV-Aggregator-Raymond/1.2"
 })
 
 
@@ -150,7 +176,11 @@ def get_node_m3u(node_id):
         )
         return ""
 
-    text = response.text.strip()
+    # 使用 utf-8-sig 自动去除 BOM
+    text = response.content.decode(
+        "utf-8-sig",
+        errors="ignore"
+    ).strip()
 
     if not text:
         return ""
@@ -215,34 +245,57 @@ def parse_m3u(m3u_text):
 
 
 # ============================================================
-# Extract channel name from EXTINF
+# Extract channel info from EXTINF
 # ============================================================
 
-def get_channel_name(block):
+def get_channel_info(block):
     """
-    从 #EXTINF 中提取频道名称。
+    从 #EXTINF 中提取频道显示名和唯一键。
 
-    例如：
+    返回 (display_name, key)
 
-    #EXTINF:-1 tvg-name="CCTV1" group-title="央视",CCTV1
-
-    返回：
-
-    CCTV1
+    display_name 优先使用 tvg-name，其次逗号后的名称。
+    key 优先使用 tvg-id，其次 display_name。
     """
+
+    display_name = ""
+    key = ""
 
     for line in block:
 
         if not line.startswith("#EXTINF:"):
             continue
 
-        if "," in line:
+        # 提取 tvg-id
+        m = re.search(r'tvg-id="([^"]*)"', line)
+        if m and m.group(1).strip():
+            key = m.group(1).strip()
+
+        # 提取 tvg-name
+        m = re.search(r'tvg-name="([^"]*)"', line)
+        if m and m.group(1).strip():
+            display_name = m.group(1).strip()
+            if not key:
+                key = display_name
+
+        # 如果还没有 display_name，尝试逗号后的文本
+        if not display_name and "," in line:
             name = line.split(",", 1)[1].strip()
-
             if name:
-                return name
+                display_name = name
+                if not key:
+                    key = name
 
-    return ""
+        if display_name and key:
+            break
+
+    if not display_name:
+        display_name = key or "Unknown"
+
+    if not key:
+        key = display_name
+
+    return display_name, key
 
 
 # ============================================================
@@ -291,7 +344,7 @@ def build_m3u():
     # 全局 URL 去重
     seen_urls = set()
 
-    # 每个频道已经保存多少个源
+    # 每个频道已经保存多少个源（按 channel_key 计数）
     channel_source_count = {}
 
     # --------------------------------------------------------
@@ -365,6 +418,9 @@ def build_m3u():
                 failed_nodes += 1
                 continue
 
+            # 节点成功获取并解析出频道
+            success_nodes += 1
+
             node_new_channels = 0
             node_duplicate_urls = 0
             node_limit_skipped = 0
@@ -392,17 +448,14 @@ def build_m3u():
                     continue
 
                 # --------------------------------------------
-                # Channel name
+                # Channel info
                 # --------------------------------------------
 
-                channel_name = get_channel_name(
-                    block
-                )
+                display_name, channel_key = get_channel_info(block)
 
-                if not channel_name:
-
-                    # 没有频道名时，用 URL 作为唯一标识
-                    channel_name = url
+                if not channel_key:
+                    # 没有频道标识时，用 URL 作为唯一标识
+                    channel_key = url
 
                 # --------------------------------------------
                 # Channel source limit
@@ -410,7 +463,7 @@ def build_m3u():
 
                 current_count = (
                     channel_source_count.get(
-                        channel_name,
+                        channel_key,
                         0
                     )
                 )
@@ -435,7 +488,7 @@ def build_m3u():
                 all_blocks.append(url)
 
                 channel_source_count[
-                    channel_name
+                    channel_key
                 ] = current_count + 1
 
                 node_new_channels += 1
@@ -447,8 +500,6 @@ def build_m3u():
 
             if node_new_channels > 0:
 
-                success_nodes += 1
-
                 print(
                     f"[INFO] Node {node_id}: "
                     f"{node_new_channels} new sources"
@@ -456,7 +507,6 @@ def build_m3u():
 
             elif node_duplicate_urls > 0:
 
-                # 节点正常，只是 URL 已经存在
                 print(
                     f"[INFO] Node {node_id}: "
                     f"all usable URLs duplicated"
@@ -705,17 +755,30 @@ async def lifespan(app: FastAPI):
         f"{MAX_SOURCES_PER_CHANNEL}"
     )
 
+    print(
+        f"[INFO] Refresh loop enabled: "
+        f"{ENABLE_REFRESH_LOOP}"
+    )
+
     # --------------------------------------------------------
     # Start background refresh
     # --------------------------------------------------------
 
-    thread = threading.Thread(
-        target=refresh_loop,
-        daemon=True,
-        name="iptv-refresh"
-    )
-
-    thread.start()
+    if ENABLE_REFRESH_LOOP:
+        thread = threading.Thread(
+            target=refresh_loop,
+            daemon=True,
+            name="iptv-refresh"
+        )
+        thread.start()
+    else:
+        # 如果不启用循环，至少启动时刷新一次
+        thread = threading.Thread(
+            target=refresh,
+            daemon=True,
+            name="iptv-initial-refresh"
+        )
+        thread.start()
 
     yield
 
@@ -730,7 +793,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPTV Aggregator Raymond",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan
 )
 
@@ -751,6 +814,10 @@ def root():
             REFRESH_INTERVAL_HOURS,
         "max_sources_per_channel":
             MAX_SOURCES_PER_CHANNEL,
+        "refresh_loop_enabled":
+            ENABLE_REFRESH_LOOP,
+        "admin_token_required":
+            bool(ADMIN_TOKEN),
         "last_update": last_update,
         "channels": last_channels,
         "nodes": last_nodes,
@@ -801,7 +868,19 @@ def iptv():
 # ============================================================
 
 @app.get("/refresh")
-def manual_refresh():
+def manual_refresh(
+    authorization: str = Header(None),
+    token: str = Query(None)
+):
+
+    # 如果设置了 ADMIN_TOKEN，则必须通过鉴权
+    if ADMIN_TOKEN:
+        expected = f"Bearer {ADMIN_TOKEN}"
+        if authorization != expected and token != ADMIN_TOKEN:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden"
+            )
 
     thread = threading.Thread(
         target=refresh,
@@ -841,4 +920,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
