@@ -35,11 +35,6 @@ def env_int(name, default, min_value=None):
     return value
 
 
-def env_list(name, default):
-    raw = os.getenv(name, default)
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
 def env_bool(name, default):
     return os.getenv(name, str(default)).lower() in ("1", "true", "yes", "on")
 
@@ -48,48 +43,31 @@ def env_bool(name, default):
 # Configuration
 # ============================================================
 
-# 上游 M3U 地址（akiralereal/iptv 的输出）
 UPSTREAM_M3U_URL = os.getenv(
     "UPSTREAM_M3U_URL",
     "https://iptv.dockers.blitz.cloud/interface.m3u"
 )
 
-# 地区关键词过滤（匹配 group-title 或频道名，为空则不过滤）
-LOCATION_KEYWORDS = env_list("LOCATION_KEYWORDS", "")
-
-# 运营商关键词过滤（匹配 group-title 或频道名，为空则不过滤）
-ISP_KEYWORDS = env_list("ISP_KEYWORDS", "")
-
-# 是否要求频道必须同时匹配地区和运营商关键词
-FILTER_REQUIRE_BOTH = env_bool("FILTER_REQUIRE_BOTH", False)
-
-# 刷新间隔（小时）
 REFRESH_INTERVAL_HOURS = env_float(
     "REFRESH_INTERVAL_HOURS", 12.0, min_value=0.1
 )
 
-# 拉取上游 M3U 的超时与重试
 UPSTREAM_TIMEOUT = env_int("UPSTREAM_TIMEOUT", 30, min_value=5)
 UPSTREAM_RETRIES = env_int("UPSTREAM_RETRIES", 3, min_value=1)
 
-# 单个流验证超时（秒）
+# 单个源验证超时（秒）
 VERIFY_TIMEOUT = env_int("VERIFY_TIMEOUT", 8, min_value=1)
 
 # 并发验证线程数
 VERIFY_WORKERS = env_int("VERIFY_WORKERS", 32, min_value=1)
 
-# 每个频道最多保留多少个可用源
+# 每个频道保留的性能最好的源数量
 MAX_SOURCES_PER_CHANNEL = env_int(
     "MAX_SOURCES_PER_CHANNEL", 5, min_value=1
 )
 
-# 是否启用源有效性验证
-ENABLE_VERIFY = env_bool("ENABLE_VERIFY", True)
-
-# 是否启用后台自动刷新循环
 ENABLE_REFRESH_LOOP = env_bool("ENABLE_REFRESH_LOOP", True)
 
-# 手动刷新鉴权 token（可选）
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
 
@@ -128,10 +106,10 @@ last_update = None
 last_error = None
 
 last_upstream_channels = 0
-last_after_filter = 0
 last_verified_sources = 0
 last_failed_sources = 0
 last_final_channels = 0
+last_final_sources = 0
 
 refresh_in_progress = False
 refresh_progress_done = 0
@@ -251,71 +229,67 @@ def get_channel_info(block):
 
 
 # ============================================================
-# Keyword filter
-# ============================================================
-
-def match_keywords(text, keywords):
-    if not keywords:
-        return False
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in keywords)
-
-
-def passes_filter(display_name, group):
-    text = f"{display_name} {group}"
-
-    has_loc = bool(LOCATION_KEYWORDS)
-    has_isp = bool(ISP_KEYWORDS)
-
-    if not has_loc and not has_isp:
-        return True
-
-    matched_loc = match_keywords(text, LOCATION_KEYWORDS)
-    matched_isp = match_keywords(text, ISP_KEYWORDS)
-
-    if FILTER_REQUIRE_BOTH and has_loc and has_isp:
-        return matched_loc and matched_isp
-
-    return matched_loc or matched_isp
-
-
-# ============================================================
-# Stream verification
+# Stream verification（带性能评分）
 # ============================================================
 
 def verify_stream(url):
-    """验证单个流是否可用。返回 (ok, reason)。"""
+    """
+    验证单个源地址是否可用，并返回响应耗时。
+
+    返回 (ok, score, reason)
+
+    score = 首字节耗时（秒），越小越好。失败时 score = inf。
+    """
+    start = time.time()
+
     try:
         session = get_session()
         r = session.get(
             url,
             timeout=VERIFY_TIMEOUT,
-            headers={"Range": "bytes=0-1"},
             stream=True,
-            allow_redirects=True
+            allow_redirects=True,
+            headers={"User-Agent": UA}
         )
+
         try:
-            if r.status_code in (200, 206):
-                try:
-                    next(r.iter_content(chunk_size=1), None)
-                except Exception:
-                    pass
-                return True, None
-            return False, f"HTTP {r.status_code}"
+            if r.status_code not in (200, 206):
+                return False, float("inf"), f"HTTP {r.status_code}"
+
+            # 读取最多 4KB 判断是否是 m3u8
+            chunk = b""
+            for piece in r.iter_content(chunk_size=1024):
+                if piece:
+                    chunk += piece
+                if len(chunk) >= 4096:
+                    break
+
+            elapsed = time.time() - start
+
+            if not chunk:
+                return False, float("inf"), "empty body"
+
+            text = chunk.decode("utf-8", errors="ignore")
+
+            if "#EXTM3U" not in text and "#EXT-X-" not in text:
+                return False, float("inf"), "not m3u8 content"
+
+            return True, elapsed, None
+
         finally:
             r.close()
 
     except requests.exceptions.Timeout:
-        return False, "timeout"
+        return False, float("inf"), "timeout"
     except requests.exceptions.ConnectionError:
-        return False, "connection error"
+        return False, float("inf"), "connection error"
     except Exception as e:
-        return False, str(e)[:80]
+        return False, float("inf"), str(e)[:80]
 
 
 def verify_one_source(index, url):
-    ok, reason = verify_stream(url)
-    return index, ok, reason
+    ok, score, reason = verify_stream(url)
+    return index, ok, score, reason
 
 
 # ============================================================
@@ -324,14 +298,14 @@ def verify_one_source(index, url):
 
 def build_m3u():
     global last_upstream_channels
-    global last_after_filter
     global last_verified_sources
     global last_failed_sources
     global last_final_channels
+    global last_final_sources
     global refresh_progress_done
     global refresh_progress_total
 
-    # 1. 拉取上游
+    # 1. 拉取上游 M3U
     m3u_text = fetch_upstream_m3u()
     blocks = parse_m3u(m3u_text)
 
@@ -340,112 +314,112 @@ def build_m3u():
 
     last_upstream_channels = len(blocks)
 
-    print(f"[INFO] Upstream channels: {len(blocks)}")
-    print(f"[INFO] Location keywords: {LOCATION_KEYWORDS}")
-    print(f"[INFO] ISP keywords: {ISP_KEYWORDS}")
-    print(f"[INFO] Filter require both: {FILTER_REQUIRE_BOTH}")
-    print(f"[INFO] Enable verify: {ENABLE_VERIFY}")
+    print(f"[INFO] Upstream sources: {len(blocks)}")
     print(f"[INFO] Verify workers: {VERIFY_WORKERS}")
     print(f"[INFO] Verify timeout: {VERIFY_TIMEOUT}s")
     print(f"[INFO] Max sources per channel: {MAX_SOURCES_PER_CHANNEL}")
 
-    # 2. 关键词过滤
-    filtered = []
-    for block, url in blocks:
-        display_name, channel_key, group = get_channel_info(block)
-        if passes_filter(display_name, group):
-            filtered.append((block, url, display_name, channel_key, group))
+    # 2. 并发验证所有源
+    refresh_progress_total = len(blocks)
+    refresh_progress_done = 0
 
-    last_after_filter = len(filtered)
-    print(f"[INFO] After keyword filter: {len(filtered)}")
+    verify_results = [None] * len(blocks)
 
-    # 3. 源有效性验证
-    if ENABLE_VERIFY and filtered:
-        refresh_progress_total = len(filtered)
-        refresh_progress_done = 0
+    with ThreadPoolExecutor(
+        max_workers=VERIFY_WORKERS,
+        thread_name_prefix="verify"
+    ) as executor:
+        future_to_index = {
+            executor.submit(verify_one_source, i, block_item[1]): i
+            for i, block_item in enumerate(blocks)
+        }
+        for future in as_completed(future_to_index):
+            idx, ok, score, reason = future.result()
+            verify_results[idx] = (ok, score, reason)
+            refresh_progress_done += 1
+            if refresh_progress_done % 50 == 0 or \
+               refresh_progress_done == len(blocks):
+                print(
+                    f"[INFO] Verify progress: "
+                    f"{refresh_progress_done}/{len(blocks)}"
+                )
 
-        verify_results = [None] * len(filtered)
-
-        with ThreadPoolExecutor(
-            max_workers=VERIFY_WORKERS,
-            thread_name_prefix="verify"
-        ) as executor:
-            future_to_index = {
-                executor.submit(verify_one_source, i, item[1]): i
-                for i, item in enumerate(filtered)
-            }
-            for future in as_completed(future_to_index):
-                idx, ok, reason = future.result()
-                verify_results[idx] = (ok, reason)
-                refresh_progress_done += 1
-                if refresh_progress_done % 20 == 0 or \
-                   refresh_progress_done == len(filtered):
-                    print(
-                        f"[INFO] Verify progress: "
-                        f"{refresh_progress_done}/{len(filtered)}"
-                    )
-    else:
-        refresh_progress_total = len(filtered)
-        refresh_progress_done = len(filtered)
-        verify_results = [(True, None) for _ in filtered]
-
-    # 4. 组装结果
-    all_blocks = []
-    seen_urls = set()
-    channel_source_count = {}
+    # 3. 按频道分组，收集可用源
+    #    channel_map: channel_key -> {
+    #        "block": block,
+    #        "display_name": display_name,
+    #        "sources": [(score, url), ...]
+    #    }
+    channel_map = {}
 
     verified_sources = 0
     failed_sources = 0
-    duplicate_urls = 0
-    limit_skipped = 0
 
-    for i, (block, url, display_name, channel_key, group) in enumerate(filtered):
-        ok, reason = verify_results[i] if verify_results[i] else (False, "not verified")
+    for i, (block, url) in enumerate(blocks):
+        ok, score, reason = verify_results[i] if verify_results[i] else (False, float("inf"), "not verified")
 
         if not ok:
             failed_sources += 1
             continue
 
-        url = url.strip()
-        if not url:
-            continue
-
-        if url in seen_urls:
-            duplicate_urls += 1
-            continue
-
-        current_count = channel_source_count.get(channel_key, 0)
-        if current_count >= MAX_SOURCES_PER_CHANNEL:
-            limit_skipped += 1
-            continue
-
-        seen_urls.add(url)
-        all_blocks.extend(block)
-        all_blocks.append(url)
-
-        channel_source_count[channel_key] = current_count + 1
         verified_sources += 1
+
+        display_name, channel_key, group = get_channel_info(block)
+
+        if channel_key not in channel_map:
+            channel_map[channel_key] = {
+                "block": block,
+                "display_name": display_name,
+                "sources": []
+            }
+
+        channel_map[channel_key]["sources"].append((score, url))
 
     last_verified_sources = verified_sources
     last_failed_sources = failed_sources
 
-    if not all_blocks:
-        raise RuntimeError(
-            "No channels survived verification/filter"
-        )
+    if not channel_map:
+        raise RuntimeError("No sources survived verification")
 
+    # 4. 每个频道按性能排序，只保留前 N 个源
+    all_blocks = []
+    total_kept = 0
+    total_dropped = 0
+
+    for channel_key, info in channel_map.items():
+        sources = info["sources"]
+
+        # 按耗时升序排序，耗时小的性能好
+        sources.sort(key=lambda x: x[0])
+
+        # 只保留前 MAX_SOURCES_PER_CHANNEL 个
+        kept = sources[:MAX_SOURCES_PER_CHANNEL]
+        dropped = len(sources) - len(kept)
+
+        total_kept += len(kept)
+        total_dropped += dropped
+
+        block = info["block"]
+
+        for score, url in kept:
+            all_blocks.extend(block)
+            all_blocks.append(url)
+
+    # 5. 组装结果
     result = "#EXTM3U\n" + "\n".join(all_blocks) + "\n"
     channel_count = result.count("#EXTINF:")
-    last_final_channels = channel_count
+
+    last_final_channels = len(channel_map)
+    last_final_sources = total_kept
 
     print("=" * 60)
     print("[INFO] Build completed")
-    print(f"[INFO] Upstream channels: {last_upstream_channels}")
-    print(f"[INFO] After keyword filter: {last_after_filter}")
-    print(f"[INFO] Verified sources: {verified_sources}")
-    print(f"[INFO] Failed sources: {failed_sources}")
-    print(f"[INFO] Duplicate URLs: {duplicate_urls}")
-    print(f"[INFO] Source-limit skipped: {limit_skipped}")
+    print(f"[INFO] Upstream sources: {last_upstream_channels}")
+    print(f"[INFO] Verified OK: {verified_sources}")
+    print(f"[INFO] Failed: {failed_sources}")
+    print(f"[INFO] Unique channels: {len(channel_map)}")
+    print(f"[INFO] Sources kept: {total_kept}")
+    print(f"[INFO] Sources dropped (over limit): {total_dropped}")
     print(f"[INFO] Final channels: {channel_count}")
     print("=" * 60)
 
@@ -522,10 +496,10 @@ def refresh_loop():
 async def lifespan(app: FastAPI):
     print("[INFO] IPTV Aggregator starting...")
     print(f"[INFO] Upstream M3U URL: {UPSTREAM_M3U_URL}")
-    print(f"[INFO] Location keywords: {LOCATION_KEYWORDS}")
-    print(f"[INFO] ISP keywords: {ISP_KEYWORDS}")
     print(f"[INFO] Refresh interval: {REFRESH_INTERVAL_HOURS} hours")
-    print(f"[INFO] Verify enabled: {ENABLE_VERIFY}")
+    print(f"[INFO] Verify workers: {VERIFY_WORKERS}")
+    print(f"[INFO] Verify timeout: {VERIFY_TIMEOUT}s")
+    print(f"[INFO] Max sources per channel: {MAX_SOURCES_PER_CHANNEL}")
     print(f"[INFO] Refresh loop enabled: {ENABLE_REFRESH_LOOP}")
 
     if ENABLE_REFRESH_LOOP:
@@ -553,7 +527,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPTV Aggregator Raymond",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -564,22 +538,18 @@ def root():
         "service": "IPTV Aggregator Raymond",
         "status": "OK",
         "upstream_m3u_url": UPSTREAM_M3U_URL,
-        "location_keywords": LOCATION_KEYWORDS,
-        "isp_keywords": ISP_KEYWORDS,
-        "filter_require_both": FILTER_REQUIRE_BOTH,
         "refresh_interval_hours": REFRESH_INTERVAL_HOURS,
-        "verify_enabled": ENABLE_VERIFY,
         "verify_workers": VERIFY_WORKERS,
         "verify_timeout": VERIFY_TIMEOUT,
         "max_sources_per_channel": MAX_SOURCES_PER_CHANNEL,
         "refresh_loop_enabled": ENABLE_REFRESH_LOOP,
         "admin_token_required": bool(ADMIN_TOKEN),
         "last_update": last_update,
-        "upstream_channels": last_upstream_channels,
-        "after_filter": last_after_filter,
+        "upstream_sources": last_upstream_channels,
         "verified_sources": last_verified_sources,
         "failed_sources": last_failed_sources,
         "final_channels": last_final_channels,
+        "final_sources": last_final_sources,
         "error": last_error,
         "iptv_url": "/iptv"
     }
@@ -590,11 +560,11 @@ def health():
     return {
         "status": "OK",
         "last_update": last_update,
-        "upstream_channels": last_upstream_channels,
-        "after_filter": last_after_filter,
+        "upstream_sources": last_upstream_channels,
         "verified_sources": last_verified_sources,
         "failed_sources": last_failed_sources,
         "final_channels": last_final_channels,
+        "final_sources": last_final_sources,
         "error": last_error,
         "refresh_in_progress": refresh_in_progress,
         "refresh_progress": f"{refresh_progress_done}/{refresh_progress_total}"
