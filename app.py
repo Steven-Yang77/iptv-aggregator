@@ -10,10 +10,6 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 
-# ============================================================
-# 配置
-# ============================================================
-
 SPIDER_URL = os.getenv(
     "SPIDER_URL",
     "https://iptvs.910501.xyz"
@@ -37,20 +33,12 @@ TIMEOUT = int(
 )
 
 
-# ============================================================
-# HTTP Session
-# ============================================================
-
 session = requests.Session()
 
 session.headers.update({
     "User-Agent": "IPTV-Aggregator-Raymond/1.0"
 })
 
-
-# ============================================================
-# 全局缓存
-# ============================================================
 
 cached_m3u = "#EXTM3U\n"
 
@@ -63,18 +51,12 @@ last_failed_nodes = 0
 last_channels = 0
 
 
-# ============================================================
-# 获取节点列表
-# ============================================================
-
 def get_nodes():
     url = f"{SPIDER_URL}/api/hotel/ips"
 
     response = session.get(
         url,
-        params={
-            "limit": 1000
-        },
+        params={"limit": 1000},
         timeout=TIMEOUT
     )
 
@@ -83,18 +65,12 @@ def get_nodes():
     data = response.json()
 
     if not isinstance(data, list):
-        raise RuntimeError("Node API returned invalid data")
+        raise RuntimeError(
+            "Node API returned invalid data"
+        )
 
     return data
 
-
-# ============================================================
-# 节点优先级
-#
-# 注意：
-# PRIORITY_KEYWORDS 只用于排序。
-# 不会因为节点不匹配关键词而被排除。
-# ============================================================
 
 def node_score(node):
     text = " ".join(
@@ -115,10 +91,6 @@ def node_score(node):
     return score
 
 
-# ============================================================
-# 获取单个节点 M3U
-# ============================================================
-
 def get_node_m3u(node_id):
     url = f"{SPIDER_URL}/api/hotel/ips/{node_id}/m3u"
 
@@ -129,7 +101,8 @@ def get_node_m3u(node_id):
 
     if response.status_code != 200:
         print(
-            f"[WARNING] Node {node_id} HTTP {response.status_code}"
+            f"[WARNING] Node {node_id} "
+            f"HTTP {response.status_code}"
         )
         return ""
 
@@ -140,23 +113,13 @@ def get_node_m3u(node_id):
 
     if "#EXTM3U" not in text:
         print(
-            f"[WARNING] Node {node_id} returned non-M3U data"
+            f"[WARNING] Node {node_id} "
+            f"returned non-M3U data"
         )
         return ""
 
     return text
 
-
-# ============================================================
-# 解析 M3U
-#
-# 一个节目通常是：
-#
-# #EXTINF:-1,...
-# http://xxxx
-#
-# 保留完整节目块。
-# ============================================================
 
 def parse_m3u(m3u_text):
     lines = [
@@ -166,7 +129,6 @@ def parse_m3u(m3u_text):
     ]
 
     blocks = []
-
     current_block = []
 
     for line in lines:
@@ -174,7 +136,6 @@ def parse_m3u(m3u_text):
         if line == "#EXTM3U":
             continue
 
-        # URL 行
         if not line.startswith("#"):
 
             if not current_block:
@@ -182,10 +143,9 @@ def parse_m3u(m3u_text):
 
             url = line
 
-            # 当前节目必须有 EXTINF
             if not any(
-                x.startswith("#EXTINF:")
-                for x in current_block
+                item.startswith("#EXTINF:")
+                for item in current_block
             ):
                 current_block = []
                 continue
@@ -205,10 +165,6 @@ def parse_m3u(m3u_text):
     return blocks
 
 
-# ============================================================
-# 构建最终 M3U
-# ============================================================
-
 def build_m3u():
 
     global last_nodes
@@ -219,7 +175,6 @@ def build_m3u():
 
     last_nodes = len(nodes)
 
-    # 按优先级排序
     nodes.sort(
         key=node_score,
         reverse=True
@@ -235,29 +190,25 @@ def build_m3u():
     )
 
     all_blocks = []
-
     seen_urls = set()
 
     success_nodes = 0
     failed_nodes = 0
 
-    # ========================================================
-    # 逐个尝试节点
-    # ========================================================
-
-    for index, node in enumerate(nodes, start=1):
+    for index, node in enumerate(
+        nodes,
+        start=1
+    ):
 
         node_id = node.get("id")
 
         region = node.get("region") or ""
-        city = node.get("city") or ""
         isp = node.get("isp") or ""
 
         score = node_score(node)
 
         print(
-            f"[INFO] "
-            f"[{index}/{len(nodes)}] "
+            f"[INFO] [{index}/{len(nodes)}] "
             f"Node {node_id} "
             f"{region} "
             f"{isp} "
@@ -271,8 +222,8 @@ def build_m3u():
             if not m3u:
 
                 print(
-                    f"[WARNING] "
-                    f"Node {node_id} returned 0 channels."
+                    f"[WARNING] Node {node_id} "
+                    f"returned 0 channels."
                 )
 
                 failed_nodes += 1
@@ -283,8 +234,8 @@ def build_m3u():
             if not blocks:
 
                 print(
-                    f"[WARNING] "
-                    f"Node {node_id} parsed 0 channels."
+                    f"[WARNING] Node {node_id} "
+                    f"parsed 0 channels."
                 )
 
                 failed_nodes += 1
@@ -294,7 +245,6 @@ def build_m3u():
 
             for block, url in blocks:
 
-                # URL 去重
                 if url in seen_urls:
                     continue
 
@@ -310,16 +260,14 @@ def build_m3u():
                 success_nodes += 1
 
                 print(
-                    f"[INFO] "
-                    f"Node {node_id}: "
+                    f"[INFO] Node {node_id}: "
                     f"{new_channels} new channels"
                 )
 
             else:
 
                 print(
-                    f"[WARNING] "
-                    f"Node {node_id}: "
+                    f"[WARNING] Node {node_id}: "
                     f"all channels duplicated"
                 )
 
@@ -328,8 +276,8 @@ def build_m3u():
             failed_nodes += 1
 
             print(
-                f"[WARNING] "
-                f"Node {node_id} failed: {e}"
+                f"[WARNING] Node {node_id} "
+                f"failed: {e}"
             )
 
             continue
@@ -337,28 +285,19 @@ def build_m3u():
     last_success_nodes = success_nodes
     last_failed_nodes = failed_nodes
 
-    # ========================================================
-    # 最终 M3U
-    # ========================================================
-
     if not all_blocks:
 
         raise RuntimeError(
-            "No channels collected from selected nodes"
+            "No channels collected "
+            "from selected nodes"
         )
 
-    result = (
+    return (
         "#EXTM3U\n"
         + "\n".join(all_blocks)
         + "\n"
     )
 
-    return result
-
-
-# ============================================================
-# 刷新
-# ============================================================
 
 def refresh():
 
@@ -370,10 +309,7 @@ def refresh():
     try:
 
         print("=" * 60)
-
-        print(
-            "[INFO] Starting refresh..."
-        )
+        print("[INFO] Starting refresh...")
 
         m3u = build_m3u()
 
@@ -386,13 +322,6 @@ def refresh():
             raise RuntimeError(
                 "No channels collected"
             )
-
-        # ====================================================
-        # 只有新数据正常时才替换缓存
-        #
-        # 如果这次刷新失败：
-        # Cinetry 继续使用旧数据。
-        # ====================================================
 
         cached_m3u = m3u
 
@@ -420,15 +349,12 @@ def refresh():
         )
 
         print(
-            "[INFO] Existing cached M3U will be kept."
+            "[INFO] Existing cached M3U "
+            "will be kept."
         )
 
         print("=" * 60)
 
-
-# ============================================================
-# 自动刷新线程
-# ============================================================
 
 def refresh_loop():
 
@@ -437,8 +363,7 @@ def refresh_loop():
         refresh()
 
         sleep_seconds = (
-            REFRESH_INTERVAL_HOURS
-            * 3600
+            REFRESH_INTERVAL_HOURS * 3600
         )
 
         print(
@@ -450,14 +375,6 @@ def refresh_loop():
             sleep_seconds
         )
 
-
-# ============================================================
-# FastAPI Lifespan
-#
-# 替代已经 deprecated 的:
-#
-# @app.on_event("startup")
-# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -480,10 +397,6 @@ async def lifespan(app: FastAPI):
     )
 
 
-# ============================================================
-# FastAPI App
-# ============================================================
-
 app = FastAPI(
     title="IPTV Aggregator Raymond",
     version="1.0.0",
@@ -491,80 +404,39 @@ app = FastAPI(
 )
 
 
-# ============================================================
-# 首页
-# ============================================================
-
 @app.get("/")
 def root():
 
     return {
         "service": "IPTV Aggregator Raymond",
         "status": "OK",
-
         "spider_url": SPIDER_URL,
-
         "priority_keywords": PRIORITY_KEYWORDS,
-
         "refresh_interval_hours":
             REFRESH_INTERVAL_HOURS,
-
-        "last_update":
-            last_update,
-
-        "channels":
-            last_channels,
-
-        "nodes":
-            last_nodes,
-
-        "success_nodes":
-            last_success_nodes,
-
-        "failed_nodes":
-            last_failed_nodes,
-
-        "error":
-            last_error,
-
-        "iptv_url":
-            "/iptv"
+        "last_update": last_update,
+        "channels": last_channels,
+        "nodes": last_nodes,
+        "success_nodes": last_success_nodes,
+        "failed_nodes": last_failed_nodes,
+        "error": last_error,
+        "iptv_url": "/iptv"
     }
 
-
-# ============================================================
-# Health
-# ============================================================
 
 @app.get("/health")
 def health():
 
     return {
         "status": "OK",
-
-        "last_update":
-            last_update,
-
-        "channels":
-            last_channels,
-
-        "nodes":
-            last_nodes,
-
-        "success_nodes":
-            last_success_nodes,
-
-        "failed_nodes":
-            last_failed_nodes,
-
-        "error":
-            last_error
+        "last_update": last_update,
+        "channels": last_channels,
+        "nodes": last_nodes,
+        "success_nodes": last_success_nodes,
+        "failed_nodes": last_failed_nodes,
+        "error": last_error
     }
 
-
-# ============================================================
-# IPTV M3U
-# ============================================================
 
 @app.get(
     "/iptv",
@@ -574,10 +446,6 @@ def iptv():
 
     return cached_m3u
 
-
-# ============================================================
-# 手动刷新
-# ============================================================
 
 @app.get("/refresh")
 def manual_refresh():
@@ -593,10 +461,6 @@ def manual_refresh():
         "status": "refresh_started"
     }
 
-
-# ============================================================
-# 启动
-# ============================================================
 
 if __name__ == "__main__":
 
@@ -614,3 +478,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+```
