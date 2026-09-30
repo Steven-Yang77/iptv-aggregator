@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import threading
@@ -478,4 +477,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-```
